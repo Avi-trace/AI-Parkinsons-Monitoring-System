@@ -214,12 +214,15 @@ function FFTChart({ spectrum, freqRes }) {
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
-export default function SpiralTest({ patientId = "anonymous", apiBase = "http://localhost:5000" , onResult= null}) {
+export default function SpiralTest({ patientId = "anonymous", apiBase = "", onResult = null }) {
   const canvasRef     = useRef(null);
   const pointsRef     = useRef([]);
   const isDrawingRef  = useRef(false);
   const startTimeRef  = useRef(null);
   const timerRef      = useRef(null);
+  const strokeRef     = useRef(-1);          // stroke index, +1 on every pen-down
+  const pathLenRef    = useRef(0);           // running path length (px) for live speed
+  const deviceRef     = useRef("unknown");   // pointerType: mouse | touch | pen
 
   const [tab,       setTab]       = useState("draw");   // "draw" | "results" | "guide"
   const [phase,     setPhase]     = useState("idle");   // "idle" | "drawing" | "done" | "loading" | "error"
@@ -266,72 +269,102 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "http://
     ctx.stroke();
   }, []);
 
-  // ── Redraw user path on top of guide ───────────────────────────────────────
+  // ── Redraw the whole user path (only on remount / clear, not per move) ──────
   const redrawPath = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const pts = pointsRef.current;
     if (pts.length < 2) return;
     const ctx = canvas.getContext("2d");
-
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-    ctx.strokeStyle = C.accent;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
+    pts.forEach((p, i) => {
+      if (i === 0 || p.stroke !== pts[i - 1].stroke) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    });
     ctx.stroke();
-
-    // Live endpoint dot
-    const last = pts[pts.length - 1];
-    ctx.beginPath();
-    ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = C.accent;
-    ctx.fill();
   }, []);
 
-  useEffect(() => { drawGuide(); }, [drawGuide]);
+  // Draw only the newest segment(s): O(1) per event instead of redrawing everything.
+  const drawSegment = useCallback((from, newPts) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !newPts.length) return;
+    const ctx = canvas.getContext("2d");
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo((from || newPts[0]).x, (from || newPts[0]).y);
+    newPts.forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.stroke();
+  }, []);
 
-  // ── Pointer helpers ─────────────────────────────────────────────────────────
-  function getPos(e) {
+  // The canvas unmounts when another tab is shown; repaint guide + path on return.
+  useEffect(() => { if (tab === "draw") { drawGuide(); redrawPath(); } }, [tab, drawGuide, redrawPath]);
+
+  // ── Pointer input ─────────────────────────────────────────────────────────
+  // Pointer events cover mouse, touch and stylus. getCoalescedEvents() returns every
+  // sample the device produced since the last event (browsers otherwise deliver at
+  // most one per display frame), and e.timeStamp is a sub-millisecond timestamp
+  // (Date.now() has 1 ms steps and caused zero-interval "speed spikes").
+  function toPoint(e, rect, scaleX, scaleY) {
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+      t: e.timeStamp,
+      stroke: strokeRef.current,
+      ...(e.pointerType === "pen" && e.pressure > 0 ? { p: e.pressure } : {}),
+    };
+  }
+
+  function addSamples(e) {
     const canvas = canvasRef.current;
     const rect   = canvas.getBoundingClientRect();
-    const scaleX = canvas.width  / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const src    = e.touches ? e.touches[0] : e;
-    return { x: (src.clientX - rect.left) * scaleX, y: (src.clientY - rect.top) * scaleY, t: Date.now() };
+    const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+    const events = typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
+    const samples = (events.length ? events : [e]).map(ev => toPoint(ev, rect, sx, sy));
+    const pts = pointsRef.current;
+    const prev = pts.length && pts[pts.length - 1].stroke === strokeRef.current ? pts[pts.length - 1] : null;
+    let last = prev;
+    samples.forEach(p => {
+      if (last) pathLenRef.current += Math.hypot(p.x - last.x, p.y - last.y);
+      last = p;
+      pts.push(p);
+    });
+    drawSegment(prev, samples);
   }
 
   function onPointerDown(e) {
+    if (e.button !== undefined && e.button !== 0) return;
     e.preventDefault();
+    e.currentTarget.setPointerCapture?.(e.pointerId);   // keep receiving moves outside the canvas
     isDrawingRef.current = true;
-    if (!startTimeRef.current) startTimeRef.current = Date.now();
+    deviceRef.current = e.pointerType || "unknown";
+    strokeRef.current += 1;
+    if (!startTimeRef.current) startTimeRef.current = e.timeStamp;
     setPhase("drawing");
-    const p = getPos(e);
-    pointsRef.current.push(p);
+    addSamples(e);
 
     timerRef.current = timerRef.current || setInterval(() => {
-      const pts     = pointsRef.current;
-      const elapsed = ((Date.now() - startTimeRef.current) / 1000).toFixed(1) + "s";
-      let dist = 0;
-      for (let i = 1; i < pts.length; i++)
-        dist += Math.hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y);
-      const spd = pts.length > 1 ? Math.round(dist / ((Date.now() - startTimeRef.current) / 1000)) : "—";
-      setLive({ points: pts.length, time: elapsed, speed: spd });
+      const pts = pointsRef.current;
+      if (!pts.length) return;
+      const secs = (pts[pts.length - 1].t - startTimeRef.current) / 1000;
+      setLive({
+        points: pts.length,
+        time: secs.toFixed(1) + "s",
+        speed: secs > 0 ? Math.round(pathLenRef.current / secs) : "—",
+      });
     }, 100);
   }
 
   function onPointerMove(e) {
     if (!isDrawingRef.current) return;
     e.preventDefault();
-    pointsRef.current.push(getPos(e));
-    drawGuide();
-    redrawPath();
+    addSamples(e);
   }
 
-  function onPointerUp() {
+  function onPointerUp(e) {
+    if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
+    e?.currentTarget?.releasePointerCapture?.(e.pointerId);
     if (pointsRef.current.length > 5) setPhase("done");
   }
 
@@ -341,6 +374,8 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "http://
     timerRef.current   = null;
     startTimeRef.current = null;
     pointsRef.current  = [];
+    strokeRef.current  = -1;
+    pathLenRef.current = 0;
     setPhase("idle");
     setLive({ points: 0, time: "0.0s", speed: "—" });
     setResult(null);
@@ -364,7 +399,13 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "http://
       const res = await fetch(`${apiBase}/api/spiral-test`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patient_id: patientId, hand: "dominant", points: pts }),
+        body: JSON.stringify({
+          patient_id: patientId, hand: "dominant",
+          // e.timeStamp counts from page load; send times relative to the first point.
+          points: pts.map(p => ({ ...p, t: p.t - pts[0].t })),
+          input_device: ["mouse", "touch", "pen"].includes(deviceRef.current) ? deviceRef.current : "unknown",
+          center_x: CX, center_y: CY, guide_radius: MAX_RADIUS,
+        }),
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
@@ -459,12 +500,10 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "http://
                   transition: "border-color 0.2s",
                 }}
                 aria-label="Drawing canvas. Draw a spiral from the centre dot outward."
-                onMouseDown={onPointerDown}
-                onMouseMove={onPointerMove}
-                onMouseUp={onPointerUp}
-                onTouchStart={onPointerDown}
-                onTouchMove={onPointerMove}
-                onTouchEnd={onPointerUp}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerUp}
               />
               {phase === "idle" && (
                 <div style={{
@@ -586,7 +625,7 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "http://
                   <MetricCard
                     label="Drawing speed"
                     value={fmt(bio.avg_speed_px_per_s, 0) + " px/s"}
-                    sub={bio.avg_speed_px_per_s < 40 ? "Slow — bradykinesia possible" : bio.avg_speed_px_per_s < 120 ? "Normal range" : "Fast"}
+                    sub={bio.avg_speed_px_per_s < 40 ? "Slow (not scored)" : bio.avg_speed_px_per_s < 120 ? "Normal range" : "Fast"}
                   />
                 </div>
 

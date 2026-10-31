@@ -71,10 +71,9 @@ export default function App() {
       </nav>
 
       {/*
-        KEY FIX: all four tabs are always mounted — only visibility toggled.
-        This keeps each test's internal state (camera, recording) alive across
-        tab switches, AND means the dashboard always receives the latest
-        onResult values without the component being destroyed and re-created.
+        All four tabs stay mounted (only visibility toggles) so results survive tab
+        switches. `active` tells a test whether it is visible: hidden tests stop the
+        shared camera/GPU tracker instead of running in the background.
       */}
       <main>
         <div style={{ display: tab === "dashboard" ? "block" : "none" }}>
@@ -90,6 +89,7 @@ export default function App() {
 
         <div style={{ display: tab === "finger" ? "block" : "none" }}>
           <FingerTapTest
+            active={tab === "finger"}
             patientId={PATIENT_ID}
             apiBase={API_BASE}
             onResult={setFingerResult}
@@ -98,6 +98,7 @@ export default function App() {
 
         <div style={{ display: tab === "spiral" ? "block" : "none" }}>
           <SpiralTest
+            active={tab === "spiral"}
             patientId={PATIENT_ID}
             apiBase={API_BASE}
             onResult={setSpiralResult}
@@ -106,6 +107,7 @@ export default function App() {
 
         <div style={{ display: tab === "tremor" ? "block" : "none" }}>
           <TremorTest
+            active={tab === "tremor"}
             patientId={PATIENT_ID}
             apiBase={API_BASE}
             onResult={setTremorResult}

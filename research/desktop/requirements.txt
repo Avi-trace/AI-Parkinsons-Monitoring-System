@@ -1,0 +1,8 @@
+# Desktop research prototypes only (track.py, valley.py). Not needed for the web app.
+opencv-python>=4.9
+mediapipe>=0.10.14,<0.10.22   # still ships the legacy mp.solutions API these scripts use
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+pandas>=2.1
+scikit-learn>=1.4

@@ -21,3 +21,11 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local patient/session data must never be committed
+backend/data/*
+!backend/data/.gitkeep
+pd_history.json
+pd_session_*.csv
+.pytest_cache/
+.ruff_cache/

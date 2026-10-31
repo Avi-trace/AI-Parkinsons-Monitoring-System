@@ -1,18 +1,17 @@
 /**
- * NeuroTrack AI — Finger Tap Test (UPDRS 3.4)
+ * NeuroTrack AI — Finger Tap Test (MDS-UPDRS 3.4)
  *
- * Records the raw thumb↔index aperture signal continuously via MediaPipe Hands.
- * The Flask backend detects taps using scipy peak-finding (no fragile state machine),
- * then computes: tap_rate, mean_speed, amplitude_decay, speed_decay, rhythm_cv,
- * hesitation_count, arrest_ratio, decrement_index.
+ * Records the raw thumb-tip <-> index-tip aperture plus hand size (wrist -> middle
+ * MCP) on every camera frame, using the shared GPU hand tracker. The backend
+ * normalises aperture by hand size, detects taps and computes the biomarkers.
  *
- * Sends: raw aperture stream [{v, t}] — NOT discrete tap events.
- * Receives: tap_events, raw_frames, biomarkers, score, severity.
- *
- * MediaPipe loaded from CDN — vite.config.js must exclude @mediapipe/* from optimizeDeps.
+ * Sends: [{v: aperture_px, t: ms, s: hand_size_px}] + measured fps.
+ * Receives: tap_events, raw_frames, biomarkers, score, severity, quality, result_id.
  */
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { useHandTracking, px } from "../tracking/useHandTracking";
+import { LANDMARK } from "../tracking/handTracker";
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const C = {
@@ -35,24 +34,7 @@ const HAND_CONNECTIONS = [
   [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
   [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
 ];
-const THUMB_TIP = 4, INDEX_TIP = 8;
-
-// ─── CDN loader ───────────────────────────────────────────────────────────────
-function loadScript(src) {
-  return new Promise((res, rej) => {
-    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
-    const s = Object.assign(document.createElement("script"), { src, crossOrigin: "anonymous" });
-    s.onload = res; s.onerror = () => rej(new Error(`Failed: ${src}`));
-    document.head.appendChild(s);
-  });
-}
-let mpPromise = null;
-function ensureMP() {
-  return mpPromise || (mpPromise = Promise.all([
-    loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"),
-    loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"),
-  ]));
-}
+const UI_UPDATE_MS = 100; // live readouts refresh at 10 Hz instead of every frame
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt = (n, d = 1) => typeof n === "number" ? n.toFixed(d) : "—";
@@ -124,7 +106,7 @@ function ApertureChart({ frames, tapEvents, width = 620, height = 140 }) {
       const y = ty(v);
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + w, y); ctx.stroke();
       ctx.fillStyle = C.textMuted; ctx.font = "9px system-ui"; ctx.textAlign = "right";
-      ctx.fillText(Math.round(v), padL - 4, y + 3);
+      ctx.fillText(vMax < 10 ? v.toFixed(1) : Math.round(v), padL - 4, y + 3);   // v2 sends hand-size units
     });
 
     // Axes
@@ -267,20 +249,16 @@ function SpeedChart({ tapEvents, width = 620, height = 100 }) {
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
-export default function FingerTapTest({ patientId = "anonymous", apiBase = "", onResult = null }) {
-  const videoRef     = useRef(null);
-  const canvasRef    = useRef(null);
-  const handsRef     = useRef(null);
-  const cameraRef    = useRef(null);
-  const timerRef     = useRef(null);
-  const onResultsRef = useRef(null);
-
+export default function FingerTapTest({ patientId = "anonymous", apiBase = "", onResult = null, active = true }) {
+  const canvasRef     = useRef(null);
+  const timerRef      = useRef(null);
+  const countdownRef  = useRef(null);
   const recordingRef  = useRef(false);
-  const startTimeRef  = useRef(null);
-  const framesRef     = useRef([]);      // [{v, t}] raw aperture stream
+  const startTsRef    = useRef(null);    // timestamp of the first recorded frame
+  const framesRef     = useRef([]);      // [{v, t, s}] raw aperture stream
+  const uiTickRef     = useRef(0);
 
   const [phase, setPhase]             = useState("idle");
-  const [scriptsReady, setScriptsReady] = useState(false);
   const [handVisible, setHandVisible] = useState(false);
   const [countdown, setCountdown]     = useState(3);
   const [timeLeft, setTimeLeft]       = useState(TEST_DURATION_S);
@@ -289,111 +267,106 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
   const [result, setResult]           = useState(null);
   const [error, setError]             = useState(null);
 
-  useEffect(() => {
-    ensureMP().then(() => setScriptsReady(true)).catch(console.warn);
-    return () => { clearInterval(timerRef.current); cameraRef.current?.stop(); handsRef.current?.close(); };
-  }, []);
-
-  // ── MediaPipe results ─────────────────────────────────────────────────
-  onResultsRef.current = useCallback((results) => {
-    const canvas = canvasRef.current, video = videoRef.current;
-    if (!canvas || !video) return;
+  // ── Per-frame handler (runs inside the tracker loop) ────────────────────
+  const onFrame = useCallback((res, ts, video) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const W = video.videoWidth, H = video.videoHeight;
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
     const ctx = canvas.getContext("2d");
-    canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
-    ctx.save(); ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+    // Mirror only the video, not the canvas, so overlay text reads correctly.
+    ctx.save(); ctx.scale(-1, 1); ctx.drawImage(video, -W, 0, W, H); ctx.restore();
 
-    let saw = false;
-    if (results.multiHandLandmarks?.length) {
-      const lm = results.multiHandLandmarks[0];
-      saw = true;
-
-      // Skeleton
+    const lm = res.landmarks?.[0];
+    let aperture = null;
+    if (lm) {
+      const mx = (i) => (1 - lm[i].x) * W, my = (i) => lm[i].y * H;   // mirrored, for drawing
       ctx.strokeStyle = C.accent + "77"; ctx.lineWidth = 1.5;
       HAND_CONNECTIONS.forEach(([a, b]) => {
-        ctx.beginPath();
-        ctx.moveTo(lm[a].x * canvas.width, lm[a].y * canvas.height);
-        ctx.lineTo(lm[b].x * canvas.width, lm[b].y * canvas.height);
-        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(mx(a), my(a)); ctx.lineTo(mx(b), my(b)); ctx.stroke();
       });
+      const th = px(lm, LANDMARK.THUMB_TIP, video), ix = px(lm, LANDMARK.INDEX_TIP, video);
+      const wr = px(lm, LANDMARK.WRIST, video), mc = px(lm, LANDMARK.MIDDLE_MCP, video);
+      aperture = Math.hypot(th.x - ix.x, th.y - ix.y);
+      const handSize = Math.hypot(wr.x - mc.x, wr.y - mc.y);
+      const open = handSize > 0 && aperture / handSize > 0.5;
 
-      const tx = lm[THUMB_TIP].x * canvas.width, ty = lm[THUMB_TIP].y * canvas.height;
-      const ix = lm[INDEX_TIP].x * canvas.width, iy = lm[INDEX_TIP].y * canvas.height;
-      const aperture = Math.hypot(tx - ix, ty - iy);
-
-      // Aperture line (colour by openness)
-      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(ix, iy);
-      ctx.strokeStyle = aperture > 40 ? C.green : C.orange;
-      ctx.lineWidth = 2.5; ctx.stroke();
-
-      // Fingertip dots
-      [{ x: tx, y: ty, c: C.yellow }, { x: ix, y: iy, c: C.orange }].forEach(({ x, y, c }) => {
-        ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2);
-        ctx.fillStyle = c; ctx.fill();
-        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(mx(LANDMARK.THUMB_TIP), my(LANDMARK.THUMB_TIP));
+      ctx.lineTo(mx(LANDMARK.INDEX_TIP), my(LANDMARK.INDEX_TIP));
+      ctx.strokeStyle = open ? C.green : C.orange; ctx.lineWidth = 2.5; ctx.stroke();
+      [[LANDMARK.THUMB_TIP, C.yellow], [LANDMARK.INDEX_TIP, C.orange]].forEach(([i, c]) => {
+        ctx.beginPath(); ctx.arc(mx(i), my(i), 7, 0, Math.PI * 2);
+        ctx.fillStyle = c; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
       });
-
-      // Aperture label
       ctx.fillStyle = "#fff"; ctx.font = "bold 13px system-ui";
-      ctx.fillText(`${Math.round(aperture)}px`, (tx + ix) / 2 + 8, (ty + iy) / 2 - 8);
+      ctx.fillText(`${Math.round(aperture)}px`,
+        (mx(LANDMARK.THUMB_TIP) + mx(LANDMARK.INDEX_TIP)) / 2 + 8, (my(LANDMARK.THUMB_TIP) + my(LANDMARK.INDEX_TIP)) / 2 - 8);
 
-      setLiveAperture(Math.round(aperture));
-
-      // Record frame
-      if (recordingRef.current && startTimeRef.current !== null) {
-        const t = performance.now() - startTimeRef.current;
-        framesRef.current.push({ v: aperture, t });
-        setLiveFrameCount(framesRef.current.length);
+      if (recordingRef.current) {
+        if (startTsRef.current === null) startTsRef.current = ts;
+        framesRef.current.push({ v: aperture, t: ts - startTsRef.current, s: handSize });
       }
     }
 
-    ctx.restore();
-    setHandVisible(saw);
+    const now = performance.now();
+    if (now - uiTickRef.current >= UI_UPDATE_MS) {
+      uiTickRef.current = now;
+      setHandVisible(Boolean(lm));
+      if (aperture !== null) setLiveAperture(Math.round(aperture));
+      if (recordingRef.current) setLiveFrameCount(framesRef.current.length);
+    }
   }, []);
+
+  const tracking = useHandTracking({ numHands: 1, onFrame });
+
+  const clearTimers = () => {
+    clearInterval(timerRef.current); timerRef.current = null;
+    clearInterval(countdownRef.current); countdownRef.current = null;
+  };
+  useEffect(() => clearTimers, []);
+
+  // Leaving the tab stops the camera and abandons an in-progress recording.
+  useEffect(() => {
+    if (active) return;
+    clearTimers();
+    recordingRef.current = false;
+    tracking.stop();
+    setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const startCamera = useCallback(async () => {
     setPhase("camera_loading"); setError(null);
-    try {
-      await ensureMP();
-      const hands = new window.Hands({
-        locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-      });
-      hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
-      hands.onResults(r => onResultsRef.current(r));
-      handsRef.current = hands;
+    const ok = await tracking.start();
+    setPhase(ok ? "ready" : "error");
+  }, [tracking]);
 
-      const cam = new window.Camera(videoRef.current, {
-        onFrame: async () => { if (handsRef.current) await handsRef.current.send({ image: videoRef.current }); },
-        width: 640, height: 480,
-      });
-      await cam.start(); cameraRef.current = cam;
-      setPhase("ready");
-    } catch (err) {
-      setError("Could not start camera. Check browser permissions."); setPhase("error");
-    }
-  }, []);
+  useEffect(() => {
+    if (tracking.status === "error" && tracking.error) setError(tracking.error);
+  }, [tracking.status, tracking.error]);
 
   function beginTest() {
     framesRef.current = [];
     setLiveFrameCount(0); setLiveAperture(0);
     setResult(null); setError(null);
     setCountdown(3); setPhase("countdown");
+    tracking.lock(true);   // fixed resolution from now until the result arrives
 
     let c = 3;
-    const cd = setInterval(() => {
+    countdownRef.current = setInterval(() => {
       c--; setCountdown(c);
-      if (c <= 0) { clearInterval(cd); startRecording(); }
+      if (c <= 0) { clearInterval(countdownRef.current); countdownRef.current = null; startRecording(); }
     }, 1000);
   }
 
   function startRecording() {
     setPhase("recording"); setTimeLeft(TEST_DURATION_S);
-    startTimeRef.current = performance.now();
+    startTsRef.current = null;
     recordingRef.current = true;
     let t = TEST_DURATION_S;
     timerRef.current = setInterval(() => {
       t--; setTimeLeft(t);
-      if (t <= 0) { clearInterval(timerRef.current); recordingRef.current = false; submit(); }
+      if (t <= 0) { clearInterval(timerRef.current); timerRef.current = null; recordingRef.current = false; submit(); }
     }, 1000);
   }
 
@@ -403,26 +376,37 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
       if (framesRef.current.length < 20) throw new Error("Too few frames captured. Make sure your hand is visible throughout the test.");
       const res = await fetch(`${apiBase}/api/finger-tap`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patient_id: patientId, hand: "dominant", duration_s: TEST_DURATION_S, frames: framesRef.current, sample_rate: 30 }),
+        body: JSON.stringify({
+          patient_id: patientId, hand: "dominant", duration_s: TEST_DURATION_S,
+          frames: framesRef.current, reported_fps: tracking.statsRef.current?.fps || undefined,
+        }),
       });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Server error ${res.status}`); }
       const data = await res.json();
       setResult(data); if (onResult) onResult(data); setPhase("done");
     } catch (err) { setError(err.message || "Analysis failed."); setPhase("error"); }
+    finally { tracking.lock(false); }
   }
 
-  function reset() { setResult(null); setError(null); setLiveFrameCount(0); setPhase("ready"); }
+  async function reset() {
+    setResult(null); setError(null); setLiveFrameCount(0);
+    if (tracking.status === "ready") { setPhase("ready"); return; }
+    await startCamera();
+  }
 
   const bio = result?.biomarkers;
   const sev = result?.severity || "Normal";
   const sevCfg = SEVERITY[sev] || SEVERITY.Normal;
 
-  const statusColor = { idle: scriptsReady ? C.green : C.yellow, camera_loading: C.yellow, ready: C.green, countdown: C.yellow, recording: C.red, analyzing: C.accent, done: C.green, error: C.red }[phase] || C.textSub;
-  const statusLabel = { idle: scriptsReady ? "Ready" : "Loading…", camera_loading: "Starting…", ready: "Camera ready", countdown: "Get ready…", recording: `Recording · ${timeLeft}s`, analyzing: "Analysing…", done: "Complete", error: "Error" }[phase] || "—";
+  const statusColor = { idle: C.green, camera_loading: C.yellow, ready: C.green, countdown: C.yellow, recording: C.red, analyzing: C.accent, done: C.green, error: C.red }[phase] || C.textSub;
+  const statusLabel = { idle: "Ready", camera_loading: "Starting…", ready: "Camera ready", countdown: "Get ready…", recording: `Recording · ${timeLeft}s`, analyzing: "Analysing…", done: "Complete", error: "Error" }[phase] || "—";
 
   return (
     <div style={{ fontFamily: "system-ui,-apple-system,sans-serif", background: C.bg, minHeight: "100vh", padding: "24px 20px", color: C.text }}>
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
+        {/* Camera feed for the tracker. Always mounted (so it exists before start() runs) and
+            kept rendered rather than display:none, so requestVideoFrameCallback keeps firing. */}
+        <video ref={tracking.videoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
 
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -447,8 +431,8 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
               <li>Click "Enable camera" — point hand at camera until detected.</li>
               <li>Tap as fast and as wide open as possible for the full 10 seconds.</li>
             </ol>
-            <button onClick={startCamera} disabled={!scriptsReady} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", background: scriptsReady ? C.accent : C.surfaceHigh, color: scriptsReady ? "#fff" : C.textMuted, fontSize: 14, fontWeight: 600, cursor: scriptsReady ? "pointer" : "not-allowed" }}>
-              {scriptsReady ? "Enable camera" : "Loading MediaPipe…"}
+            <button onClick={startCamera} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", background: C.accent, color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              Enable camera
             </button>
           </div>
         )}
@@ -457,8 +441,7 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
         {phase !== "idle" && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: `1px solid ${phase === "recording" ? C.red + "66" : C.border}` }}>
-              <video ref={videoRef} style={{ display: "none" }} playsInline muted />
-              <canvas ref={canvasRef} width={640} height={480} style={{ width: "100%", display: "block", background: C.surfaceHigh, transform: "scaleX(-1)" }} />
+              <canvas ref={canvasRef} width={640} height={480} style={{ width: "100%", display: "block", background: C.surfaceHigh }} />
 
               {/* Badges */}
               {["ready","countdown","recording"].includes(phase) && (
@@ -476,7 +459,7 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
               {phase === "recording" && (
                 <div style={{ position: "absolute", top: 10, right: 10 }}>
                   <span style={{ fontSize: 11, padding: "3px 9px", borderRadius: 12, background: "#00000066", color: C.green, border: `1px solid ${C.green}44`, fontVariantNumeric: "tabular-nums" }}>
-                    {liveFrameCount} frames
+                    {liveFrameCount} frames · {Math.round(tracking.stats?.fps || 0)} fps · {tracking.stats?.delegate || "—"}
                   </span>
                 </div>
               )}
@@ -557,8 +540,8 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
             {/* Metric grid */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
               <MetricCard label="Tap rate" value={fmt(bio.tap_rate)} sub="taps/sec" color={bio.tap_rate >= 4 ? C.green : bio.tap_rate >= 2.5 ? C.yellow : C.red} />
-              <MetricCard label="Mean amplitude" value={fmt(bio.mean_amplitude, 0)} sub="px aperture" />
-              <MetricCard label="Mean speed" value={fmt(bio.mean_speed, 0)} sub="px/s closing" color={bio.mean_speed > 200 ? C.green : bio.mean_speed > 100 ? C.yellow : C.red} />
+              <MetricCard label="Mean amplitude" value={result.amplitude_unit === "hand" ? pct(bio.mean_amplitude) : fmt(bio.mean_amplitude, 0)} sub={result.amplitude_unit === "hand" ? "of hand size" : "px aperture"} />
+              <MetricCard label="Mean speed" value={fmt(bio.mean_speed, 1)} sub={result.amplitude_unit === "hand" ? "hand-lengths/s" : "px/s"} color={result.amplitude_unit !== "hand" ? C.text : bio.mean_speed > 8 ? C.green : bio.mean_speed > 4 ? C.yellow : C.red} />
               <MetricCard label="Hesitations" value={bio.hesitation_count} sub={bio.hesitation_count === 0 ? "None" : "Freezing events"} color={bio.hesitation_count === 0 ? C.green : bio.hesitation_count <= 2 ? C.yellow : C.red} />
               <MetricCard label="Rhythm CV" value={pct(bio.rhythm_cv)} sub={bio.rhythm_cv < 0.15 ? "Regular" : bio.rhythm_cv < 0.3 ? "Some irregularity" : "Arrhythmic"} color={bio.rhythm_cv < 0.15 ? C.green : bio.rhythm_cv < 0.3 ? C.yellow : C.red} />
               <MetricCard label="Decrement" value={pct(bio.decrement_index)} sub="0% = no decay" color={bio.decrement_index < 0.2 ? C.green : bio.decrement_index < 0.5 ? C.yellow : C.red} />
