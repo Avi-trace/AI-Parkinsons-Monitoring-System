@@ -4,7 +4,11 @@ import { relative } from "node:path";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
-const results = JSON.parse(input || "[]");
+if (!input.trim()) {
+  console.log("::error title=eslint::no lint report produced");
+  process.exit(2);
+}
+const results = JSON.parse(input);
 let errors = 0;
 for (const file of results) {
   for (const m of file.messages) {
