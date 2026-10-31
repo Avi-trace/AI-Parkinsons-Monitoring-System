@@ -40,5 +40,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Lint (non-blocking until the frontend rework)
-        run: npm run lint
+        run: npx eslint . -f json | node scripts/eslint-annotate.mjs
         continue-on-error: true
