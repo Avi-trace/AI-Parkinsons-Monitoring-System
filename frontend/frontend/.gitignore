@@ -26,3 +26,5 @@ dist-ssr
 # MediaPipe runtime + model (copied/downloaded by scripts/copy-mediapipe-assets.mjs)
 public/mediapipe/
 public/models/
+eslint-report.json
+eslint-stderr.txt

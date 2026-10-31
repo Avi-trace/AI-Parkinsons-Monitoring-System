@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, sana-hand-tracking]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -38,6 +39,14 @@ jobs:
           cache-dependency-path: frontend/frontend/package-lock.json
       - run: npm ci
       - run: npm run build
-      - name: Lint (non-blocking until the frontend rework)
-        run: npm run lint
-        continue-on-error: true
+      - name: Lint
+        run: |
+          set +e
+          npx eslint . -f json -o eslint-report.json 2> eslint-stderr.txt
+          code=$?
+          if [ $code -eq 2 ] || [ ! -s eslint-report.json ]; then
+            # exit 2 = eslint itself crashed (config/plugin problem), not lint findings
+            echo "::error title=eslint crashed::$(tail -c 900 eslint-stderr.txt | tr '\n' ' ')"
+            exit 2
+          fi
+          node scripts/eslint-annotate.mjs < eslint-report.json

@@ -318,7 +318,10 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
     }
   }, []);
 
-  const tracking = useHandTracking({ numHands: 1, onFrame });
+  const {
+    videoRef: trackerVideoRef, status: trackerStatus, error: trackerError, stats: trackerStats,
+    statsRef: trackerStatsRef, start: startTracker, stop: stopTracker, lock: lockTracker,
+  } = useHandTracking({ numHands: 1, onFrame });
 
   const clearTimers = () => {
     clearInterval(timerRef.current); timerRef.current = null;
@@ -327,30 +330,37 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
   useEffect(() => clearTimers, []);
 
   // Leaving the tab stops the camera and abandons an in-progress recording.
+  // Leaving the tab stops the camera and abandons an in-progress recording.
   useEffect(() => {
     if (active) return;
     clearTimers();
     recordingRef.current = false;
-    tracking.stop();
-    setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
-  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+    stopTracker();
+  }, [active, stopTracker]);
+
+  // Reset the visible phase when the tab is hidden (adjusting state during render,
+  // the React-recommended alternative to setState inside an effect).
+  const [wasActive, setWasActive] = useState(active);
+  if (active !== wasActive) {
+    setWasActive(active);
+    if (!active) setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
+  }
 
   const startCamera = useCallback(async () => {
     setPhase("camera_loading"); setError(null);
-    const ok = await tracking.start();
+    const ok = await startTracker();
     setPhase(ok ? "ready" : "error");
-  }, [tracking]);
+  }, [startTracker]);
 
-  useEffect(() => {
-    if (tracking.status === "error" && tracking.error) setError(tracking.error);
-  }, [tracking.status, tracking.error]);
+  // Camera/tracker errors come straight from the hook; analysis errors from local state.
+  const shownError = error || (trackerStatus === "error" ? trackerError : null);
 
   function beginTest() {
     framesRef.current = [];
     setLiveFrameCount(0); setLiveAperture(0);
     setResult(null); setError(null);
     setCountdown(3); setPhase("countdown");
-    tracking.lock(true);   // fixed resolution from now until the result arrives
+    lockTracker(true);   // fixed resolution from now until the result arrives
 
     let c = 3;
     countdownRef.current = setInterval(() => {
@@ -378,19 +388,19 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           patient_id: patientId, hand: "dominant", duration_s: TEST_DURATION_S,
-          frames: framesRef.current, reported_fps: tracking.statsRef.current?.fps || undefined,
+          frames: framesRef.current, reported_fps: trackerStatsRef.current?.fps || undefined,
         }),
       });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Server error ${res.status}`); }
       const data = await res.json();
       setResult(data); if (onResult) onResult(data); setPhase("done");
     } catch (err) { setError(err.message || "Analysis failed."); setPhase("error"); }
-    finally { tracking.lock(false); }
+    finally { lockTracker(false); }
   }
 
   async function reset() {
     setResult(null); setError(null); setLiveFrameCount(0);
-    if (tracking.status === "ready") { setPhase("ready"); return; }
+    if (trackerStatus === "ready") { setPhase("ready"); return; }
     await startCamera();
   }
 
@@ -406,7 +416,7 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
         {/* Camera feed for the tracker. Always mounted (so it exists before start() runs) and
             kept rendered rather than display:none, so requestVideoFrameCallback keeps firing. */}
-        <video ref={tracking.videoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
+        <video ref={trackerVideoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
 
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -459,7 +469,7 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
               {phase === "recording" && (
                 <div style={{ position: "absolute", top: 10, right: 10 }}>
                   <span style={{ fontSize: 11, padding: "3px 9px", borderRadius: 12, background: "#00000066", color: C.green, border: `1px solid ${C.green}44`, fontVariantNumeric: "tabular-nums" }}>
-                    {liveFrameCount} frames · {Math.round(tracking.stats?.fps || 0)} fps · {tracking.stats?.delegate || "—"}
+                    {liveFrameCount} frames · {Math.round(trackerStats?.fps || 0)} fps · {trackerStats?.delegate || "—"}
                   </span>
                 </div>
               )}
@@ -501,9 +511,9 @@ export default function FingerTapTest({ patientId = "anonymous", apiBase = "", o
         )}
 
         {/* Error */}
-        {error && (
+        {shownError && (
           <div style={{ background: C.redDim, border: `1px solid ${C.red}44`, borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
-            <p style={{ fontSize: 13, color: C.red, margin: "0 0 8px" }}>{error}</p>
+            <p style={{ fontSize: 13, color: C.red, margin: "0 0 8px" }}>{shownError}</p>
             <button onClick={reset} style={{ fontSize: 12, color: C.accent, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Try again →</button>
           </div>
         )}

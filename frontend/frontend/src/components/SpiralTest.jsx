@@ -111,7 +111,7 @@ function MetricCard({ label, value, sub, highlight }) {
   );
 }
 
-function BiomarkerBar({ label, value, max, unit = "", color, invert = false }) {
+function BiomarkerBar({ label, value, max, unit = "", color }) {
   const pctFill = Math.min(100, Math.round((value / max) * 100));
   const displayVal = typeof value === "number" ? (unit === "%" ? Math.round(value) + "%" : fmt(value) + (unit ? " " + unit : "")) : "—";
   return (
@@ -425,7 +425,6 @@ export default function SpiralTest({ patientId = "anonymous", apiBase = "", onRe
   // ─── Render ────────────────────────────────────────────────────────────────
   const bio  = result?.biomarkers;
   const sev  = result?.severity || "Normal";
-  const sevCfg = SEVERITY[sev] || SEVERITY.Normal;
 
   const statusMap = {
     idle:    { label: "Ready",          color: C.textSub  },
