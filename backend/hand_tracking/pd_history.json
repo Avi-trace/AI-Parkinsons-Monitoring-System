@@ -1,0 +1,26 @@
+[
+  {
+    "timestamp": "2026-07-02T22:47:33.531151",
+    "mode": "FINGER TAPPING",
+    "side": "Left",
+    "tap_count": 57,
+    "avg_speed": 4.745939526517183,
+    "speed_decay": -0.004557044472370133,
+    "amp_decay": 0.3793354165403953,
+    "tremor_power": 17.68034871729566,
+    "hilbert_freq": 2.0853844762580147,
+    "hilbert_freq_dev": 2085284.4762580146
+  },
+  {
+    "timestamp": "2026-07-02T22:47:33.531151",
+    "mode": "FINGER TAPPING",
+    "side": "Right",
+    "tap_count": 65,
+    "avg_speed": 4.714738256817514,
+    "speed_decay": 0.16922265323894514,
+    "amp_decay": 0.2516591018477136,
+    "tremor_power": 14.779995896910169,
+    "hilbert_freq": 1.958498088399144,
+    "hilbert_freq_dev": 1958398.0883991441
+  }
+]
