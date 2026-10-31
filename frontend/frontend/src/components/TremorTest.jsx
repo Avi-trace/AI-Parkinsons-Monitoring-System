@@ -1,46 +1,21 @@
 /**
  * NeuroTrack AI — Postural Tremor Test
- * Webcam + MediaPipe Hands, both hands simultaneously, 15s hold.
+ * Webcam + shared GPU hand tracker (MediaPipe Tasks), both hands, 15 s hold.
  *
- * Fixes vs previous version:
- *  1. Left/Right label swap — canvas is mirrored (scaleX:-1) so MediaPipe's
- *     "Left" label appears on the right side of screen. We flip the assignment:
- *     MediaPipe "Left" → stored as right_hand, "Right" → stored as left_hand.
- *  2. Composite landmark tracking — instead of wrist only (landmark[0]),
- *     we use the mean of wrist(0) + middle MCP(9) + middle tip(12).
- *     This captures both proximal wrist tremor AND distal finger tremor.
- *  3. Amplitude noise floor lowered (backend) — 5px → 2px so small
- *     distal tremors at arm's length are not filtered out.
- *  4. NEW — Per-hand fps tracking. The live fps badge used to show
- *     leftFrames.length + rightFrames.length combined, which can look
- *     like "18fps" while each hand individually is only getting ~9fps —
- *     right around the backend's reliability floor for frequency
- *     detection. Now each hand's fps is tracked and shown separately.
- *  5. NEW — minTrackingConfidence lowered 0.5 → 0.4. Fast/deliberate
- *     shaking causes motion blur, which drops MediaPipe's per-frame
- *     tracking confidence. At 0.5 this was triggering full re-detection
- *     (slower than steady tracking) more often during exactly the motion
- *     we're trying to measure, dragging per-hand fps down further. 0.4
- *     tolerates brief confidence dips without forcing a re-detect, while
- *     minDetectionConfidence (used for the more expensive initial/re-
- *     detection pass) is left untouched.
- *  6. NEW — pre-submit per-hand fps diagnostic log, so a low-fps cause
- *     of "Not detected" results is visible in the console instead of
- *     only showing up as an opaque result.
- *  7. NEW — result persists across page refresh via localStorage, keyed
- *     per patientId, so reloading the page doesn't wipe the last score.
- *  8. NEW — during "recording", skip the expensive per-connection
- *     skeleton drawing every other frame (data capture is unaffected —
- *     every frame is still recorded). Canvas drawing runs synchronously
- *     inside the MediaPipe onResults callback, so its cost was eating
- *     into the time available before the next frame can be processed,
- *     directly capping per-hand fps. This is the main lever for getting
- *     more hands above the ~9fps reliable-frequency floor.
- *
- * MediaPipe loaded from CDN (not npm) — see vite.config.js for exclusion.
+ *  - Handedness: the tracker sees the un-mirrored camera image, and MediaPipe's
+ *    labels assume a mirrored (selfie) image, so its "Left" is the patient's
+ *    physical right hand. We swap accordingly.
+ *  - Tracked point per hand = mean of wrist(0), middle MCP(9) and middle tip(12);
+ *    hand size = wrist -> middle MCP (backend normalises amplitude by it).
+ *  - Timestamps are the camera frame capture times from the tracker.
+ *  - The measured fps is sent; the backend rejects < 15 fps and only searches the
+ *    full 3-12 Hz band at 30+ fps.
+ *  - The last result persists across refresh (localStorage, keyed per patient)
+ *    and is re-published to the dashboard on load.
  */
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { useHandTracking, px } from "../tracking/useHandTracking";
 
 const C = {
   bg: "#0d1117", surface: "#161b22", surfaceHigh: "#1c2128",
@@ -57,7 +32,7 @@ const SEVERITY = {
   Severe:   { color: C.red,    dim: C.redDim    },
 };
 const TEST_DURATION_S = 15;
-const MIN_RELIABLE_FPS = 9; // must match backend MIN_FREQ_HEADROOM assumptions
+const MIN_RELIABLE_FPS = 15; // must match backend MIN_TREMOR_FPS (constants.py)
 
 // FIX 7: persistence helpers
 const storageKey = (patientId) => `neurotrack_last_result_${patientId}`;
@@ -95,22 +70,6 @@ const MIDDLE_MCP = 9;
 const MIDDLE_TIP = 12;
 // Hand size reference: wrist → middle MCP distance (px)
 // Used by backend to normalize amplitude independent of camera distance
-
-function loadScript(src) {
-  return new Promise((res, rej) => {
-    if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
-    const s = Object.assign(document.createElement("script"), { src, crossOrigin: "anonymous" });
-    s.onload = res; s.onerror = () => rej(new Error(`Failed: ${src}`));
-    document.head.appendChild(s);
-  });
-}
-let mpPromise = null;
-function ensureMP() {
-  return mpPromise || (mpPromise = Promise.all([
-    loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"),
-    loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"),
-  ]));
-}
 
 const fmt = (n, d = 1) => typeof n === "number" ? n.toFixed(d) : "—";
 
@@ -162,155 +121,76 @@ function StabilityCard({ side, scores }) {
   );
 }
 
-export default function TremorTest({ patientId = "anonymous", apiBase = "", onResult = null }) {
-  const videoRef     = useRef(null);
-  const canvasRef    = useRef(null);
-  const handsRef     = useRef(null);
-  const cameraRef    = useRef(null);
-  const timerRef     = useRef(null);
-  const onResultsRef = useRef(null);
-
-  // ── FIX 1: swap key names so "left on screen" = left_hand in data ──────
-  // Canvas is mirrored (scaleX:-1). MediaPipe sees unmirrored feed and labels
-  // the hand on its left as "Left". After mirroring, that hand appears on
-  // screen's RIGHT. So we must swap: MP "Left" → our right, MP "Right" → our left.
-  const leftFrames   = useRef([]);   // patient's physical left hand
-  const rightFrames  = useRef([]);   // patient's physical right hand
-
+export default function TremorTest({ patientId = "anonymous", apiBase = "", onResult = null, active = true }) {
+  const canvasRef     = useRef(null);
+  const timerRef      = useRef(null);
+  const countdownRef  = useRef(null);
+  const leftFrames    = useRef([]);   // patient's physical left hand
+  const rightFrames   = useRef([]);   // patient's physical right hand
   const recordingRef  = useRef(false);
-  const startTimeRef  = useRef(null);
-  const isBusyRef     = useRef(false);  // throttle: skip frame if MediaPipe still processing
+  const startTsRef    = useRef(null);
+  const uiTickRef     = useRef(0);
 
   const [phase, setPhase]               = useState("idle");
-  const [scriptsReady, setScriptsReady] = useState(false);
   const [handsVisible, setHandsVisible] = useState({ left: false, right: false });
   const [countdown, setCountdown]       = useState(3);
   const [timeLeft, setTimeLeft]         = useState(TEST_DURATION_S);
-  // FIX 4: per-hand fps instead of one combined number
-  const [liveFps, setLiveFps]           = useState({ left: 0, right: 0 });
-  // FIX 7: seed from localStorage so a refresh doesn't wipe the last score.
+  const [liveFps, setLiveFps]           = useState({ left: 0, right: 0 });   // per hand
   const [result, setResult]             = useState(() => loadStoredResult(patientId));
   const [error, setError]               = useState(null);
-  // FIX 4: separate counters per hand
   const fpsCounterRef = useRef({ left: { count: 0, last: 0 }, right: { count: 0, last: 0 } });
-  // FIX 8: phase mirrored into a ref so the onResults callback (defined
-  // once, not re-created per render) can cheaply check "are we recording"
-  // without depending on stale closure state.
-  const phaseRef  = useRef(phase);
-  const drawTickRef = useRef(0);
 
-  useEffect(() => { phaseRef.current = phase; }, [phase]);
-
+  // A result restored from storage goes straight to the results view and is
+  // re-published so the dashboard sees it too.
   useEffect(() => {
-    ensureMP().then(() => setScriptsReady(true)).catch(console.warn);
-    return () => { clearInterval(timerRef.current); cameraRef.current?.stop(); handsRef.current?.close(); };
-  }, []);
-
-  // FIX 7: if a result already exists on mount (restored from storage),
-  // jump straight to the "done" view instead of idle.
-  useEffect(() => {
-    if (result) setPhase("done");
+    if (result) { setPhase("done"); onResult?.(result); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── FIX 2 + 3: composite landmark tracking ───────────────────────────
-  onResultsRef.current = useCallback((results) => {
-    const canvas = canvasRef.current, video = videoRef.current;
-    if (!canvas || !video) return;
+  const onFrame = useCallback((res, ts, video) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const W = video.videoWidth, H = video.videoHeight;
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
     const ctx = canvas.getContext("2d");
-    canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
-    ctx.save(); ctx.clearRect(0, 0, canvas.width, canvas.height);
-    // Mirror only the video feed — NOT the whole canvas.
-      // This way labels, dots, and text render correctly (not flipped).
-      ctx.save();
-      ctx.scale(-1, 1);
-      ctx.drawImage(results.image, -canvas.width, 0, canvas.width, canvas.height);
-      ctx.restore();
+    ctx.save(); ctx.scale(-1, 1); ctx.drawImage(video, -W, 0, W, H); ctx.restore();   // mirror video only
 
     let sawLeft = false, sawRight = false;
+    const recording = recordingRef.current;
+    if (recording && startTsRef.current === null) startTsRef.current = ts;
 
-    // FIX 8: during recording, only do the expensive per-connection/dot
-    // drawing on every other frame. This is purely a rendering decision —
-    // frame *data capture* below is untouched and still runs every frame.
-    // Canvas drawing happens synchronously inside this callback, so its
-    // cost was directly delaying when `finally()` fires and the next
-    // frame can be sent to MediaPipe, capping achievable fps right when
-    // fast motion needs it most.
-    drawTickRef.current++;
-    const isRecording = phaseRef.current === "recording";
-    const doFullDraw = !isRecording || (drawTickRef.current % 2 === 0);
-
-    results.multiHandLandmarks?.forEach((lm, i) => {
-      const mpLabel = results.multiHandedness[i].label; // MediaPipe's label (unmirrored)
-
-      // FIX 1: because canvas is mirrored, swap MP Left↔Right to get screen-correct label
-      // MP "Left"  → physically on screen's right → store as rightFrames
-      // MP "Right" → physically on screen's left  → store as leftFrames
+    (res.landmarks || []).forEach((lm, i) => {
+      const mpLabel = res.handedness?.[i]?.[0]?.categoryName;   // "Left" | "Right"
+      if (!mpLabel) return;
       const physicalSide = mpLabel === "Left" ? "right" : "left";
+      // Two detections with the same label in one frame: keep only the first.
+      if ((physicalSide === "left" && sawLeft) || (physicalSide === "right" && sawRight)) return;
+      if (physicalSide === "left") sawLeft = true; else sawRight = true;
       const color = physicalSide === "left" ? C.green : C.accent;
 
-      // FIX 2: composite hand position = mean of wrist + middle MCP + middle tip
-      // This captures finger tremor that wrist-only tracking misses
       const trackPoints = [WRIST, MIDDLE_MCP, MIDDLE_TIP];
-      // Mirror x coordinate to match the flipped video feed
-      const cx_raw = trackPoints.reduce((s, idx) => s + lm[idx].x, 0) / trackPoints.length;
-      const cy_raw = trackPoints.reduce((s, idx) => s + lm[idx].y, 0) / trackPoints.length;
-      const px = (1 - cx_raw) * canvas.width;   // flip x
-      const py = cy_raw * canvas.height;
+      const cx = trackPoints.reduce((acc, idx) => acc + lm[idx].x, 0) / trackPoints.length;
+      const cy = trackPoints.reduce((acc, idx) => acc + lm[idx].y, 0) / trackPoints.length;
+      const dx = (1 - cx) * W, dy = cy * H;   // mirrored, for drawing
 
-      if (doFullDraw) {
-        // Draw skeleton
-        ctx.strokeStyle = color + "88"; ctx.lineWidth = 1.5;
-        HAND_CONNECTIONS.forEach(([a, b]) => {
-          ctx.beginPath();
-          ctx.moveTo((1 - lm[a].x) * canvas.width, lm[a].y * canvas.height);
-          ctx.lineTo((1 - lm[b].x) * canvas.width, lm[b].y * canvas.height);
-          ctx.stroke();
-        });
+      ctx.strokeStyle = color + "88"; ctx.lineWidth = 1.5;
+      HAND_CONNECTIONS.forEach(([a, b]) => {
+        ctx.beginPath();
+        ctx.moveTo((1 - lm[a].x) * W, lm[a].y * H);
+        ctx.lineTo((1 - lm[b].x) * W, lm[b].y * H);
+        ctx.stroke();
+      });
+      ctx.beginPath(); ctx.arc(dx, dy, 8, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 12px system-ui";
+      ctx.fillText(physicalSide.charAt(0).toUpperCase() + physicalSide.slice(1), dx + 10, dy - 8);
 
-        // Draw tracked landmarks (mirrored x)
-        trackPoints.forEach(idx => {
-          ctx.beginPath();
-          ctx.arc((1 - lm[idx].x) * canvas.width, lm[idx].y * canvas.height, 5, 0, Math.PI * 2);
-          ctx.fillStyle = color + "bb"; ctx.fill();
-        });
+      if (recording) {
+        const wr = px(lm, WRIST, video), mc = px(lm, MIDDLE_MCP, video);
+        const frame = { x: cx * W, y: cy * H, s: Math.hypot(wr.x - mc.x, wr.y - mc.y), t: ts - startTsRef.current };
+        (physicalSide === "left" ? leftFrames : rightFrames).current.push(frame);
 
-        // Draw centroid
-        ctx.beginPath(); ctx.arc(px, py, 8, 0, Math.PI * 2);
-        ctx.fillStyle = color; ctx.fill();
-        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
-
-        // Label — show physical side so it matches what user sees on mirrored screen
-        ctx.fillStyle = "#fff"; ctx.font = "bold 12px system-ui";
-        ctx.fillText(physicalSide.charAt(0).toUpperCase() + physicalSide.slice(1), px + 10, py - 8);
-      } else {
-        // Lightweight marker only — keeps some visual feedback without
-        // the full skeleton draw cost.
-        ctx.beginPath(); ctx.arc(px, py, 6, 0, Math.PI * 2);
-        ctx.fillStyle = color; ctx.fill();
-      }
-
-      if (physicalSide === "left")  sawLeft  = true;
-      if (physicalSide === "right") sawRight = true;
-
-      // Record composite position.
-      // z = wrist→middleMCP distance (px) used by backend for distance normalization.
-      // This makes amplitude independent of how far the hand is from the camera.
-      if (recordingRef.current && startTimeRef.current !== null) {
-        const wristX = lm[WRIST].x * canvas.width,  wristY = lm[WRIST].y * canvas.height;
-        const mcpX   = lm[MIDDLE_MCP].x * canvas.width, mcpY = lm[MIDDLE_MCP].y * canvas.height;
-        const handSizePx = Math.hypot(wristX - mcpX, wristY - mcpY);
-        const frame = {
-          x: px, y: py,
-          z: handSizePx,   // hand size in px — backend divides amplitude by this
-          t: performance.now() - startTimeRef.current,
-        };
-        if (physicalSide === "left")  leftFrames.current.push(frame);
-        if (physicalSide === "right") rightFrames.current.push(frame);
-
-        // FIX 4: update live fps per-hand, not combined. A combined number
-        // can read "18fps" while one hand individually is only at ~9fps —
-        // right at the backend's reliability floor — and hide the problem.
         const now = performance.now();
         const counter = fpsCounterRef.current[physicalSide];
         counter.count++;
@@ -321,51 +201,38 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
       }
     });
 
-    ctx.restore();
-    setHandsVisible({ left: sawLeft, right: sawRight });
+    const now = performance.now();
+    if (now - uiTickRef.current >= 100) {   // live UI at 10 Hz, not every frame
+      uiTickRef.current = now;
+      setHandsVisible(prev => (prev.left === sawLeft && prev.right === sawRight) ? prev : { left: sawLeft, right: sawRight });
+    }
   }, []);
+
+  const tracking = useHandTracking({ numHands: 2, onFrame });
+
+  const clearTimers = () => {
+    clearInterval(timerRef.current); timerRef.current = null;
+    clearInterval(countdownRef.current); countdownRef.current = null;
+  };
+  useEffect(() => clearTimers, []);
+
+  useEffect(() => {
+    if (active) return;
+    clearTimers();
+    recordingRef.current = false;
+    tracking.stop();
+    setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (tracking.status === "error" && tracking.error) setError(tracking.error);
+  }, [tracking.status, tracking.error]);
 
   const startCamera = useCallback(async () => {
     setPhase("camera_loading"); setError(null);
-    try {
-      await ensureMP();
-      const hands = new window.Hands({
-        locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-      });
-      hands.setOptions({
-        maxNumHands: 2,
-        modelComplexity: 0,             // 0 = lite model, much faster (~2x)
-        minDetectionConfidence: 0.65,
-        // FIX 5: lowered 0.5 → 0.4. Fast/deliberate shaking causes motion
-        // blur, which drops per-frame tracking confidence. At 0.5 that was
-        // triggering full re-detection passes (slower than steady tracking)
-        // more often during exactly the motion we're measuring, which drags
-        // per-hand fps down below the backend's ~9fps reliability floor.
-        minTrackingConfidence: 0.4,
-      });
-      hands.onResults(r => onResultsRef.current(r));
-      handsRef.current = hands;
-
-      const cam = new window.Camera(videoRef.current, {
-        onFrame: () => {
-          // Skip frame if MediaPipe is still processing the previous one.
-          // This prevents queue buildup while still running as fast as possible.
-          if (isBusyRef.current || !handsRef.current) return;
-          isBusyRef.current = true;
-          handsRef.current.send({ image: videoRef.current })
-            .catch(() => {})
-            .finally(() => { isBusyRef.current = false; });
-        },
-        width: 320,
-        height: 240,
-        facingMode: "user",
-      });
-      await cam.start(); cameraRef.current = cam;
-      setPhase("ready");
-    } catch (err) {
-      setError("Could not start camera. Check browser permissions."); setPhase("error");
-    }
-  }, []);
+    const ok = await tracking.start();
+    setPhase(ok ? "ready" : "error");
+  }, [tracking]);
 
   function beginTest() {
     leftFrames.current = []; rightFrames.current = [];
@@ -373,21 +240,22 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     setLiveFps({ left: 0, right: 0 });
     setResult(null); setError(null);
     setCountdown(3); setPhase("countdown");
+    tracking.lock(true);
     let c = 3;
-    const cd = setInterval(() => {
+    countdownRef.current = setInterval(() => {
       c--; setCountdown(c);
-      if (c <= 0) { clearInterval(cd); startRecording(); }
+      if (c <= 0) { clearInterval(countdownRef.current); countdownRef.current = null; startRecording(); }
     }, 1000);
   }
 
   function startRecording() {
     setPhase("recording"); setTimeLeft(TEST_DURATION_S);
-    startTimeRef.current = performance.now();
+    startTsRef.current = null;
     recordingRef.current = true;
     let t = TEST_DURATION_S;
     timerRef.current = setInterval(() => {
       t--; setTimeLeft(t);
-      if (t <= 0) { clearInterval(timerRef.current); recordingRef.current = false; submit(); }
+      if (t <= 0) { clearInterval(timerRef.current); timerRef.current = null; recordingRef.current = false; submit(); }
     }, 1000);
   }
 
@@ -395,37 +263,11 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     setPhase("analyzing");
     try {
       const lf = leftFrames.current, rf = rightFrames.current;
-
-      // FIX 6: per-hand fps diagnostic before sending, so a low-fps cause
-      // of "Not detected" is visible in the console instead of only
-      // showing up as an opaque backend result.
-      const fpsOf = (frames) => {
-        if (frames.length < 2) return 0;
-        const durS = (frames[frames.length - 1].t - frames[0].t) / 1000;
-        return durS > 0 ? frames.length / durS : 0;
-      };
-      const lFps = fpsOf(lf), rFps = fpsOf(rf);
-      console.log(
-        `[TremorTest] Left: ${lf.length} frames @ ${lFps.toFixed(1)}fps` +
-        `${lFps > 0 && lFps < MIN_RELIABLE_FPS ? " ⚠️ below reliable-frequency floor" : ""}` +
-        ` | Right: ${rf.length} frames @ ${rFps.toFixed(1)}fps` +
-        `${rFps > 0 && rFps < MIN_RELIABLE_FPS ? " ⚠️ below reliable-frequency floor" : ""}`
-      );
-      if (lf.length > 10) {
-        const lxs = lf.map(f => f.x), lys = lf.map(f => f.y);
-        console.log("[TremorTest] Left X range:", Math.min(...lxs).toFixed(1), "–", Math.max(...lxs).toFixed(1),
-          "| Y range:", Math.min(...lys).toFixed(1), "–", Math.max(...lys).toFixed(1));
-      }
-      if (rf.length > 10) {
-        const rxs = rf.map(f => f.x), rys = rf.map(f => f.y);
-        console.log("[TremorTest] Right X range:", Math.min(...rxs).toFixed(1), "–", Math.max(...rxs).toFixed(1),
-          "| Y range:", Math.min(...rys).toFixed(1), "–", Math.max(...rys).toFixed(1));
-      }
-
       const payload = {
-        patient_id: patientId, duration_s: TEST_DURATION_S,
-        left_hand:  lf.length >= 30 ? lf  : null,
-        right_hand: rf.length >= 30 ? rf  : null,
+        patient_id: patientId, mode: "postural", duration_s: TEST_DURATION_S,
+        left_hand:  lf.length >= 30 ? lf : null,
+        right_hand: rf.length >= 30 ? rf : null,
+        reported_fps: tracking.statsRef.current?.fps || undefined,
       };
       if (!payload.left_hand && !payload.right_hand)
         throw new Error("No hands detected. Make sure both arms are fully visible and try again.");
@@ -436,35 +278,35 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
       });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `Server error ${res.status}`); }
       const data = await res.json();
-      console.log("[TremorTest] Result — L:", data.left?.tremor_frequency_hz, "Hz score:", data.left?.stability_score,
-        "| R:", data.right?.tremor_frequency_hz, "Hz score:", data.right?.stability_score,
-        "| L amp:", data.left?.amplitude_px, "R amp:", data.right?.amplitude_px);
       setResult(data);
-      saveStoredResult(patientId, data);   // FIX 7: survive a page refresh
+      saveStoredResult(patientId, data);
       if (onResult) onResult(data);
       setPhase("done");
     } catch (err) {
       setError(err.message || "Analysis failed."); setPhase("error");
+    } finally {
+      tracking.lock(false);
     }
   }
 
-  function reset() {
+  async function reset() {
     setResult(null); setError(null);
     clearStoredResult(patientId);
     leftFrames.current = []; rightFrames.current = [];
-    // FIX 7: a restored result can exist before the camera has ever been
-    // started on this page load — route to "idle" (shows Enable camera)
-    // rather than "ready" (assumes camera already running) in that case.
-    setPhase(cameraRef.current ? "ready" : "idle");
+    if (tracking.status === "ready") { setPhase("ready"); return; }
+    setPhase("idle");   // camera not running (e.g. result restored after a refresh)
   }
 
   const canStart = handsVisible.left || handsVisible.right;
-  const statusColor = { idle: scriptsReady ? C.green : C.yellow, camera_loading: C.yellow, ready: C.green, countdown: C.yellow, recording: C.red, analyzing: C.accent, done: C.green, error: C.red }[phase] || C.textSub;
-  const statusLabel = { idle: scriptsReady ? "Ready" : "Loading…", camera_loading: "Starting…", ready: "Camera ready", countdown: "Get ready…", recording: `Recording · ${timeLeft}s`, analyzing: "Analysing…", done: "Complete", error: "Error" }[phase] || "—";
+  const statusColor = { idle: C.green, camera_loading: C.yellow, ready: C.green, countdown: C.yellow, recording: C.red, analyzing: C.accent, done: C.green, error: C.red }[phase] || C.textSub;
+  const statusLabel = { idle: "Ready", camera_loading: "Starting…", ready: "Camera ready", countdown: "Get ready…", recording: `Recording · ${timeLeft}s`, analyzing: "Analysing…", done: "Complete", error: "Error" }[phase] || "—";
 
   return (
     <div style={{ fontFamily: "system-ui,-apple-system,sans-serif", background: C.bg, minHeight: "100vh", padding: "24px 20px", color: C.text }}>
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
+        {/* Camera feed for the tracker: always mounted, rendered (not display:none) so
+            requestVideoFrameCallback keeps firing. */}
+        <video ref={tracking.videoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
           <div>
@@ -490,8 +332,8 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
               <li>Once both hands are detected, tap "Begin test".</li>
               <li>Hold as still as possible for the full 15 seconds.</li>
             </ol>
-            <button onClick={startCamera} disabled={!scriptsReady} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", background: scriptsReady ? C.accent : C.surfaceHigh, color: scriptsReady ? "#fff" : C.textMuted, fontSize: 14, fontWeight: 600, cursor: scriptsReady ? "pointer" : "not-allowed" }}>
-              {scriptsReady ? "Enable camera" : "Loading MediaPipe…"}
+            <button onClick={startCamera} style={{ width: "100%", padding: "11px 0", borderRadius: 8, border: "none", background: C.accent, color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+              Enable camera
             </button>
           </div>
         )}
@@ -499,7 +341,6 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
         {phase !== "idle" && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: `1px solid ${phase === "recording" ? C.red + "66" : C.border}` }}>
-              <video ref={videoRef} style={{ display: "none" }} playsInline muted />
               <canvas
                 ref={canvasRef} width={320} height={240}
                 style={{ width: "100%", display: "block", background: C.surfaceHigh }}

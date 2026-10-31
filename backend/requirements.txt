@@ -1,0 +1,6 @@
+# NeuroTrack AI backend (Python 3.11+)
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3
+numpy>=2.0,<3
+scipy>=1.13,<2

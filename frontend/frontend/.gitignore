@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# MediaPipe runtime + model (copied/downloaded by scripts/copy-mediapipe-assets.mjs)
+public/mediapipe/
+public/models/
