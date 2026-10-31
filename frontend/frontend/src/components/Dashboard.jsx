@@ -17,7 +17,7 @@
  * and can save a session via POST /api/session.
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 
 // ─── Tokens ──────────────────────────────────────────────────────────────────
 const C = {
@@ -294,7 +294,6 @@ export default function Dashboard({
 
   // ── Fetch patient history ────────────────────────────────────────────────
   useEffect(() => {
-    setLoadingH(true);
     fetch(`${apiBase}/api/patient/${patientId}/history?limit=10`)
       .then(r => r.ok ? r.json() : [])
       .then(data => { setHistory(data); setLoadingH(false); })
@@ -364,7 +363,7 @@ export default function Dashboard({
             onClick={saveSession}
             disabled={testsComplete === 0 || saving}
             style={{
-              padding: "9px 18px", borderRadius: 8, border: "none", fontSize: 13, fontWeight: 600, cursor: "pointer",
+              padding: "9px 18px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
               background: saved ? C.greenDim : testsComplete > 0 ? C.teal : C.surfaceHigh,
               color: saved ? C.green : testsComplete > 0 ? "#fff" : C.textMuted,
               border: `1px solid ${saved ? C.green : testsComplete > 0 ? C.teal : C.border}`,

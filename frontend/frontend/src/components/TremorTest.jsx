@@ -55,7 +55,9 @@ function saveStoredResult(patientId, data) {
 function clearStoredResult(patientId) {
   try {
     localStorage.removeItem(storageKey(patientId));
-  } catch {}
+  } catch {
+    // storage unavailable: nothing to clear
+  }
 }
 
 const HAND_CONNECTIONS = [
@@ -131,7 +133,8 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
   const startTsRef    = useRef(null);
   const uiTickRef     = useRef(0);
 
-  const [phase, setPhase]               = useState("idle");
+  // A result restored from storage opens straight on the results view.
+  const [phase, setPhase]               = useState(() => (loadStoredResult(patientId) ? "done" : "idle"));
   const [handsVisible, setHandsVisible] = useState({ left: false, right: false });
   const [countdown, setCountdown]       = useState(3);
   const [timeLeft, setTimeLeft]         = useState(TEST_DURATION_S);
@@ -140,10 +143,9 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
   const [error, setError]               = useState(null);
   const fpsCounterRef = useRef({ left: { count: 0, last: 0 }, right: { count: 0, last: 0 } });
 
-  // A result restored from storage goes straight to the results view and is
-  // re-published so the dashboard sees it too.
+  // A result restored from storage is re-published so the dashboard sees it too.
   useEffect(() => {
-    if (result) { setPhase("done"); onResult?.(result); }
+    if (result) onResult?.(result);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -208,7 +210,10 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     }
   }, []);
 
-  const tracking = useHandTracking({ numHands: 2, onFrame });
+  const {
+    videoRef: trackerVideoRef, status: trackerStatus, error: trackerError, stats: trackerStats,
+    statsRef: trackerStatsRef, start: startTracker, stop: stopTracker, lock: lockTracker,
+  } = useHandTracking({ numHands: 2, onFrame });
 
   const clearTimers = () => {
     clearInterval(timerRef.current); timerRef.current = null;
@@ -216,23 +221,30 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
   };
   useEffect(() => clearTimers, []);
 
+  // Leaving the tab stops the camera and abandons an in-progress recording.
   useEffect(() => {
     if (active) return;
     clearTimers();
     recordingRef.current = false;
-    tracking.stop();
-    setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
-  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+    stopTracker();
+  }, [active, stopTracker]);
 
-  useEffect(() => {
-    if (tracking.status === "error" && tracking.error) setError(tracking.error);
-  }, [tracking.status, tracking.error]);
+  // Reset the visible phase when the tab is hidden (adjusting state during render,
+  // the React-recommended alternative to setState inside an effect).
+  const [wasActive, setWasActive] = useState(active);
+  if (active !== wasActive) {
+    setWasActive(active);
+    if (!active) setPhase((p) => (p === "done" || p === "error" ? p : "idle"));
+  }
+
+  // Camera/tracker errors come straight from the hook; analysis errors from local state.
+  const shownError = error || (trackerStatus === "error" ? trackerError : null);
 
   const startCamera = useCallback(async () => {
     setPhase("camera_loading"); setError(null);
-    const ok = await tracking.start();
+    const ok = await startTracker();
     setPhase(ok ? "ready" : "error");
-  }, [tracking]);
+  }, [startTracker]);
 
   function beginTest() {
     leftFrames.current = []; rightFrames.current = [];
@@ -240,7 +252,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     setLiveFps({ left: 0, right: 0 });
     setResult(null); setError(null);
     setCountdown(3); setPhase("countdown");
-    tracking.lock(true);
+    lockTracker(true);
     let c = 3;
     countdownRef.current = setInterval(() => {
       c--; setCountdown(c);
@@ -267,7 +279,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
         patient_id: patientId, mode: "postural", duration_s: TEST_DURATION_S,
         left_hand:  lf.length >= 30 ? lf : null,
         right_hand: rf.length >= 30 ? rf : null,
-        reported_fps: tracking.statsRef.current?.fps || undefined,
+        reported_fps: trackerStatsRef.current?.fps || undefined,
       };
       if (!payload.left_hand && !payload.right_hand)
         throw new Error("No hands detected. Make sure both arms are fully visible and try again.");
@@ -285,7 +297,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     } catch (err) {
       setError(err.message || "Analysis failed."); setPhase("error");
     } finally {
-      tracking.lock(false);
+      lockTracker(false);
     }
   }
 
@@ -293,7 +305,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
     setResult(null); setError(null);
     clearStoredResult(patientId);
     leftFrames.current = []; rightFrames.current = [];
-    if (tracking.status === "ready") { setPhase("ready"); return; }
+    if (trackerStatus === "ready") { setPhase("ready"); return; }
     setPhase("idle");   // camera not running (e.g. result restored after a refresh)
   }
 
@@ -306,7 +318,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
         {/* Camera feed for the tracker: always mounted, rendered (not display:none) so
             requestVideoFrameCallback keeps firing. */}
-        <video ref={tracking.videoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
+        <video ref={trackerVideoRef} style={{ position: "fixed", left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none" }} playsInline muted />
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
           <div>
@@ -414,9 +426,9 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
           </div>
         )}
 
-        {error && (
+        {shownError && (
           <div style={{ background: C.redDim, border: `1px solid ${C.red}44`, borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
-            <p style={{ fontSize: 13, color: C.red, margin: "0 0 8px" }}>{error}</p>
+            <p style={{ fontSize: 13, color: C.red, margin: "0 0 8px" }}>{shownError}</p>
             <button onClick={reset} style={{ fontSize: 12, color: C.accent, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Try again →</button>
           </div>
         )}
