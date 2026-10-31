@@ -39,7 +39,7 @@ jobs:
           cache-dependency-path: frontend/frontend/package-lock.json
       - run: npm ci
       - run: npm run build
-      - name: Lint (non-blocking until the frontend rework)
+      - name: Lint
         run: |
           set +e
           npx eslint . -f json -o eslint-report.json 2> eslint-stderr.txt
@@ -50,4 +50,3 @@ jobs:
             exit 2
           fi
           node scripts/eslint-annotate.mjs < eslint-report.json
-        continue-on-error: true

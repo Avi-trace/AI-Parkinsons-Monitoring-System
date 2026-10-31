@@ -211,7 +211,7 @@ export default function TremorTest({ patientId = "anonymous", apiBase = "", onRe
   }, []);
 
   const {
-    videoRef: trackerVideoRef, status: trackerStatus, error: trackerError, stats: trackerStats,
+    videoRef: trackerVideoRef, status: trackerStatus, error: trackerError,
     statsRef: trackerStatsRef, start: startTracker, stop: stopTracker, lock: lockTracker,
   } = useHandTracking({ numHands: 2, onFrame });
 
