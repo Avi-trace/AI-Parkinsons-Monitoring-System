@@ -20,7 +20,7 @@ jobs:
           cache-dependency-path: backend/requirements-dev.txt
       - run: pip install -r backend/requirements-dev.txt
       - name: Lint
-        run: ruff check backend tests
+        run: ruff check --output-format=github backend tests
       - name: Tests (synthetic-signal regression suite + API)
         run: pytest -q tests
 
